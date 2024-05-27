@@ -6,10 +6,10 @@ from typing import Any, List, Optional, TYPE_CHECKING
 import sympy
 
 from torch._inductor.codecache import get_cpp_wrapper_cubin_path_name
+from torch._inductor.runtime.triton_heuristics import grid as default_grid
 
 from .. import config
 from ..codecache import CudaKernelParamCache
-from ..triton_heuristics import grid as default_grid
 from ..virtualized import V
 from .aoti_hipify_utils import maybe_hipify_code_wrapper
 from .codegen_device_driver import cuda_kernel_driver, cuda_kernel_header
@@ -23,7 +23,8 @@ if TYPE_CHECKING:
 def is_int(s: str) -> bool:
     # Cpp code gen adds L at the end of ints
     # Lets remove it for checking whether we have an int or not
-    if s and s[-1] == "L":
+    # TODO: do we need to check if this is int32 or int64?
+    if isinstance(s, str) and s[-1] == "L":
         s = s[:-1]
     try:
         int(s)
