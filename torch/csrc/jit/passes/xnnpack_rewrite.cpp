@@ -114,9 +114,127 @@ void insertPrePackedLinearOp(std::shared_ptr<Graph>& graph) {
   linear_rewriter.runOnGraph(graph);
 }
 
+void replaceConv2dStrPaddingWithIntPadding(std::shared_ptr<Graph>& graph) {
+  std::string conv_2d_pattern = R"(
+    graph(%input, %weight, %bias, %stride:int[], %padding:str, %dilation:int[], %groups:int):
+        %res = aten::conv2d(%input, %weight, %bias, %stride, %padding, %dilation, %groups)
+        return (%res) )";
+
+  std::string int_padding_pattern = R"(
+    graph(%input, %weight, %bias, %stride:int[], %padding:str, %dilation:int[], %groups:int):
+        %zero : int = prim::Constant[value=0]()
+        %one : int = prim::Constant[value=1]()
+        %two : int = prim::Constant[value=2]()
+        %three : int = prim::Constant[value=3]()
+        %same : str = prim::Constant[value="same"]()
+
+        %stride_h : int, %stride_w : int = prim::ListUnpack(%stride)
+        %dilation_h : int, %dilation_w : int = prim::ListUnpack(%dilation)
+
+        %cond_padding_same : bool = aten::eq(%padding, %same)
+        %stride_h_gt_one : bool = aten::gt(%stride_h, %one)
+        %stride_w_gt_one : bool = aten::gt(%stride_w, %one)
+        %any_stride_gt_one : bool = aten::__or__(%stride_h_gt_one, %stride_w_gt_one)
+        %invalid_config : bool = aten::__and__(%cond_padding_same, %any_stride_gt_one)
+
+        %err_msg : str = prim::Constant[value="SAME padding with stride > 1 is not supported"]()
+        %result = prim::If(%invalid_config)
+          block0():
+              %none: NoneType = prim::Constant()
+              prim::RaiseException(%err_msg, %none)
+              -> (%none)
+          block1():
+              %input_h : int = aten::size(%input, %two)
+              %input_w : int = aten::size(%input, %three)
+              %kernel_size_h : int = aten::size(%weight, %two)
+              %kernel_size_w : int = aten::size(%weight, %three)
+
+              %kernel_h_minus_one : int = aten::sub(%kernel_size_h, %one)
+              %kernel_w_minus_one : int = aten::sub(%kernel_size_w, %one)
+              %dilated_kernel_h : int = aten::mul(%kernel_h_minus_one, %dilation_h)
+              %dilated_kernel_w : int = aten::mul(%kernel_w_minus_one, %dilation_w)
+              %effective_kernel_size_h : int = aten::add(%dilated_kernel_h, %one)
+              %effective_kernel_size_w : int = aten::add(%dilated_kernel_w, %one)
+
+              %pad_total_h : int = aten::sub(%effective_kernel_size_h, %one)
+              %pad_total_w : int = aten::sub(%effective_kernel_size_w, %one)
+              %pad_h : int = aten::floordiv(%pad_total_h, %two)
+              %pad_w : int = aten::floordiv(%pad_total_w, %two)
+
+              %padding_final : int[] = prim::If(%cond_padding_same)
+                block0():
+                    %constructed_pad : int[] = prim::ListConstruct(%pad_h, %pad_w)
+                    -> (%constructed_pad)
+                block1():
+                    %zero_pad : int[] = prim::ListConstruct(%zero, %zero)
+                    -> (%zero_pad)
+
+              %output = aten::conv2d(%input, %weight, %bias, %stride, %padding_final, %dilation, %groups)
+              -> (%output)
+
+        return (%result)
+    )";
+
+  std::vector<std::pair<std::string, std::string>> value_mappings(
+      {{"zero", "res"},
+       {"one", "res"},
+       {"two", "res"},
+       {"three", "res"},
+       {"same", "res"},
+       {"stride_h", "res"},
+       {"stride_w", "res"},
+       {"dilation_h", "res"},
+       {"dilation_w", "res"},
+       {"cond_padding_same", "res"},
+       {"stride_h_gt_one", "res"},
+       {"stride_w_gt_one", "res"},
+       {"any_stride_gt_one", "res"},
+       {"invalid_config", "res"},
+       {"result", "res"},
+       {"input_h", "res"},
+       {"input_w", "res"},
+       {"kernel_size_h", "res"},
+       {"kernel_size_w", "res"},
+       {"kernel_h_minus_one", "res"},
+       {"kernel_w_minus_one", "res"},
+       {"dilated_kernel_h", "res"},
+       {"dilated_kernel_w", "res"},
+       {"effective_kernel_size_h", "res"},
+       {"effective_kernel_size_w", "res"},
+       {"pad_total_h", "res"},
+       {"pad_total_w", "res"},
+       {"pad_h", "res"},
+       {"pad_w", "res"},
+       {"padding_final", "res"},
+       {"constructed_pad", "res"},
+       {"zero_pad", "res"},
+       {"output", "res"}});
+
+  SubgraphRewriter rewriter;
+  rewriter.RegisterRewritePattern(
+      conv_2d_pattern, int_padding_pattern, value_mappings);
+
+  auto filter_padding =
+      [](const Match& match,
+         const std::unordered_map<std::string, Value*>& vmap) {
+        auto* node = match.nodes_map.at(vmap.at("res")->node());
+        return node->schema().overload_name() == "padding";
+      };
+
+  rewriter.runOnGraph(graph, filter_padding);
+}
+
 void insertPrePackedConv2dOp(std::shared_ptr<Graph>& graph) {
   // Replace _convolution with conv2d
   graph_rewrite_helper::replaceConvolutionWithAtenConv(graph);
+  replaceConv2dStrPaddingWithIntPadding(graph);
+
+  auto filter_padding =
+      [](const Match& match,
+         const std::unordered_map<std::string, Value*>& vmap) {
+        auto* node = match.nodes_map.at(vmap.at("res")->node());
+        return node->schema().overload_name() != "padding";
+      };
 
   std::string conv_2d_pattern = R"(
     graph(%input, %weight, %bias, %stride:int[], %padding:int[], %dilation:int[], %groups:int):
@@ -140,7 +258,7 @@ void insertPrePackedConv2dOp(std::shared_ptr<Graph>& graph) {
   SubgraphRewriter rewriter;
   rewriter.RegisterRewritePattern(
       conv_2d_pattern, prepacked_ops_conv2d_pattern, value_mappings);
-  rewriter.runOnGraph(graph);
+  rewriter.runOnGraph(graph, filter_padding);
 
   std::string conv_2d_transpose_pattern = R"(
       graph(%input, %weight, %bias, %stride:int[], %padding:int[], %dilation:int[],
@@ -165,7 +283,7 @@ void insertPrePackedConv2dOp(std::shared_ptr<Graph>& graph) {
       conv_2d_transpose_pattern,
       prepacked_ops_conv2d_transpose_pattern,
       value_mappings);
-  transpose_rewriter.runOnGraph(graph);
+  transpose_rewriter.runOnGraph(graph, filter_padding);
 }
 
 void fuseHardtanhWithPackedOps(std::shared_ptr<Graph>& graph) {
